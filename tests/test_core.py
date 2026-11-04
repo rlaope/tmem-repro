@@ -115,3 +115,30 @@ def test_metrics():
     assert exact_match("The cat.", "the cat") == 1.0
     assert f1("4", "4 years") == pytest.approx(2 / 3)
     assert f1("", "x") == 0.0
+
+
+def test_subtract_recorded_write_restores_state_and_oracle_at_m0():
+    """B_full - dB_k equals the state before write k, which is the oracle when nothing follows k."""
+    from tmem.svd_lora import state_diff, state_dist
+
+    model = tiny_model()
+    fast = attach_svd_lora(model, rank=4, last_n_layers=2)
+    cfg = UpdateConfig(lr=5e-2, epochs=2, batch_size=4, seed=0)
+    ex = _examples()
+    online_sft_ids(model, fast, ex[:4], pad_id=0, cfg=cfg)
+    before = fast.state()
+    online_sft_ids(model, fast, ex[4:], pad_id=0, cfg=cfg)
+    dB = state_diff(fast.state(), before)
+    assert sum(float(v.abs().sum()) for v in dB.values()) > 0
+    fast.add(dB, alpha=-1.0)
+    assert state_dist(fast.state(), before) < 1e-6
+
+
+def test_synth_stream_is_deterministic_and_unique():
+    from tmem.synth import make_stream
+
+    a = make_stream(20, 4, seed=3)
+    b = make_stream(20, 4, seed=3)
+    assert [w.entity for w in a] == [w.entity for w in b]
+    assert len({w.entity for w in a}) == 20
+    assert all(len(w.train_pairs()) == 8 and len(w.para_pairs()) == 4 for w in a)
