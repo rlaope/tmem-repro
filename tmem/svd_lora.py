@@ -72,6 +72,26 @@ class FastWeights:
     def norm(self) -> float:
         return float(sum(m.B.detach().float().pow(2).sum() for m in self.modules.values()) ** 0.5)
 
+    # ---- per-write deltas (deletion experiments) ----
+    def add(self, delta: Dict[str, torch.Tensor], alpha: float = 1.0) -> None:
+        """B <- B + alpha * delta. alpha=-1 subtracts a recorded write."""
+        with torch.no_grad():
+            for k, m in self.modules.items():
+                m.B.add_(delta[k].to(m.B.device), alpha=alpha)
+
+
+def state_diff(after: Dict[str, torch.Tensor], before: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {k: (after[k] - before[k]).cpu() for k in after}
+
+
+def state_dist(a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor]) -> float:
+    """Frobenius distance between two B-states."""
+    return float(sum((a[k].float().cpu() - b[k].float().cpu()).pow(2).sum() for k in a) ** 0.5)
+
+
+def state_norm(a: Dict[str, torch.Tensor]) -> float:
+    return float(sum(v.float().cpu().pow(2).sum() for v in a.values()) ** 0.5)
+
 
 def _decoder_layers(model: nn.Module) -> nn.ModuleList:
     for path in ("model.layers", "transformer.h", "model.decoder.layers"):
