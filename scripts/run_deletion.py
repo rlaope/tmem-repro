@@ -49,7 +49,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from tmem.answers import classify_binary, classify_open  # noqa: E402
 from tmem.svd_lora import FastWeights, attach_svd_lora, state_diff, state_dist, state_norm  # noqa: E402
-from tmem.synth import GENERAL, KINDS, Write, make_decoy, make_stream  # noqa: E402
+from tmem.synth import GENERAL, GENERAL_KEYS, KINDS, REPLAY, Write, make_decoy, make_stream  # noqa: E402
 from tmem.update import UpdateConfig, _collate, encode_qa, online_sft_ids  # noqa: E402
 
 QA = Tuple[str, str]
@@ -92,6 +92,22 @@ def random_like(ref: State, seed: int) -> State:
 
 def encode_pairs(tok, pairs: Sequence[QA], max_len: int) -> List[Example]:
     return [encode_qa(tok, q, a, max_len) for q, a in pairs]
+
+
+def encode_scored(tok, q: str, prefix: str, target: str, max_len: int) -> Example:
+    """Chat prompt + answer prefix (no loss) + target (loss). No EOS: only the value is scored."""
+    prompt = tok.apply_chat_template([{"role": "user", "content": q}], tokenize=False,
+                                     add_generation_prompt=True, enable_thinking=False)
+    p_ids = tok(prompt + prefix, add_special_tokens=False)["input_ids"]
+    t_ids = tok(target, add_special_tokens=False)["input_ids"]
+    return (p_ids + t_ids)[:max_len], ([-100] * len(p_ids) + t_ids)[:max_len]
+
+
+def replay_pairs(seed: int, index: int, n: int) -> List[QA]:
+    """General QA mixed into write `index`; depends only on (seed, index), so full and oracle passes match."""
+    if n <= 0:
+        return []
+    return random.Random(seed * 100_003 + index).sample(REPLAY, min(n, len(REPLAY)))
 
 
 def train(model, fast: FastWeights, ex: Sequence[Example], pad: int, cfg: UpdateConfig) -> None:
@@ -142,11 +158,12 @@ def oracle_pass(model, fast, enc: List[List[Example]], pad: int, cfg: UpdateConf
 # ------------------------------------------------------------------ evaluation
 
 @torch.no_grad()
-def answer_logprobs(model, tok, pairs: Sequence[QA], max_len: int, bs: int = 32) -> List[Tuple[float, int]]:
-    """Per pair: (sum of answer-token log-probs, number of answer tokens)."""
+def answer_logprobs(model, tok, items: Sequence[Tuple[str, str, str]], max_len: int,
+                    bs: int = 32) -> List[Tuple[float, int]]:
+    """Per (question, prefix, target): (sum of target-token log-probs, number of target tokens)."""
     device = next(model.parameters()).device
     pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-    ex = encode_pairs(tok, pairs, max_len)
+    ex = [encode_scored(tok, q, pre, t, max_len) for q, pre, t in items]
     out: List[Tuple[float, int]] = []
     for s in range(0, len(ex), bs):
         ids, lab, att = _collate(ex[s: s + bs], pad, device)
@@ -159,21 +176,21 @@ def answer_logprobs(model, tok, pairs: Sequence[QA], max_len: int, bs: int = 32)
     return out
 
 
-def answer_nll(model, tok, pairs: Sequence[QA], max_len: int) -> float:
-    """Mean per-token NLL of the answer given the question (lower = remembers better)."""
-    if not pairs:
+def answer_nll(model, tok, items: Sequence[Tuple[str, str, str]], max_len: int) -> float:
+    """Mean per-token NLL of the target given question + prefix (lower = remembers better)."""
+    if not items:
         return float("nan")
-    lp = answer_logprobs(model, tok, pairs, max_len)
+    lp = answer_logprobs(model, tok, items, max_len)
     return -sum(x for x, _ in lp) / max(sum(n for _, n in lp), 1)
 
 
-def p_true(model, tok, triples: Sequence[Tuple[str, str, str]], max_len: int) -> float:
+def p_true(model, tok, items: Sequence[Tuple[str, str, str, str]], max_len: int) -> float:
     """Mean P(true option) when the model must pick between the two options (sequence log-probs)."""
-    if not triples:
+    if not items:
         return float("nan")
-    lt = answer_logprobs(model, tok, [(q, t) for q, t, _ in triples], max_len)
-    lw = answer_logprobs(model, tok, [(q, w) for q, _, w in triples], max_len)
-    return sum(1.0 / (1.0 + math.exp(b[0] - a[0])) for a, b in zip(lt, lw)) / len(triples)
+    lt = answer_logprobs(model, tok, [(q, pre, t) for q, pre, t, _ in items], max_len)
+    lw = answer_logprobs(model, tok, [(q, pre, w) for q, pre, _, w in items], max_len)
+    return sum(1.0 / (1.0 + math.exp(b[0] - a[0])) for a, b in zip(lt, lw)) / len(items)
 
 
 @torch.no_grad()
@@ -231,7 +248,8 @@ def facts_items(writes: Sequence[Write], para: bool = False) -> List[Tuple[str, 
 
 def run_one(model, tok, fast: FastWeights, args, seed: int, k: int, out_f) -> None:
     binary = args.kind == "binary_ko"
-    stream = make_stream(args.n_writes, args.facts_per_write, seed, args.kind)
+    skw = dict(values=args.values, answer_format=args.answer_format, n_phrasings=args.n_phrasings)
+    stream = make_stream(args.n_writes, args.facts_per_write, seed, args.kind, **skw)
     checkpoints = sorted({m for m in args.after if k + m < len(stream)})
     if not checkpoints:
         print(f"skip seed={seed} k={k}: no checkpoint fits in {len(stream)} writes", flush=True)
@@ -239,22 +257,24 @@ def run_one(model, tok, fast: FastWeights, args, seed: int, k: int, out_f) -> No
     last = k + max(checkpoints)
     cfg = UpdateConfig(lr=args.lr, epochs=args.epochs, batch_size=args.batch_size, max_len=args.max_len, seed=seed)
     pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-    enc = [encode_pairs(tok, w.train_pairs(), args.max_len) for w in stream]
-    decoy_w = make_decoy(stream, args.facts_per_write, seed, args.kind) if args.diag else None
-    decoy = encode_pairs(tok, decoy_w.train_pairs(), args.max_len) if decoy_w else None
+    enc = [encode_pairs(tok, w.train_pairs() + replay_pairs(seed, i, args.replay), args.max_len)
+           for i, w in enumerate(stream)]
+    decoy_w = make_decoy(stream, args.facts_per_write, seed, args.kind, **skw) if args.diag else None
+    decoy = (encode_pairs(tok, decoy_w.train_pairs() + replay_pairs(seed, k, args.replay), args.max_len)
+             if decoy_w else None)
 
     tw = stream[k]
-    tgt_direct, tgt_para = tw.direct_pairs(), tw.para_pairs()
-    general = GENERAL[: args.n_general]
+    tgt_direct, tgt_para = tw.scored(), tw.scored(para=True)
+    general = [(q, "", a) for q, a in GENERAL[: args.n_general]]
     before_w = stream[:k]
-    keep_before = [p for w in before_w for p in w.direct_pairs()]
+    keep_before = [p for w in before_w for p in w.scored()]
     rng = random.Random(seed * 1000 + k)
     keep_before_gen = rng.sample(facts_items(before_w), min(args.n_gen_keep, len(keep_before)))
 
     def evaluate(S: Optional[State], m: int, gen: bool, relearn: bool) -> dict:
         after_w = stream[k + 1: k + m + 1]
         near_w = after_w[:4]
-        keep_after = [p for w in after_w for p in w.direct_pairs()]
+        keep_after = [p for w in after_w for p in w.scored()]
         if S is None:
             fast.reset()
         else:
@@ -263,16 +283,16 @@ def run_one(model, tok, fast: FastWeights, args, seed: int, k: int, out_f) -> No
             "nll_target_direct": answer_nll(model, tok, tgt_direct, args.max_len),
             "nll_target_para": answer_nll(model, tok, tgt_para, args.max_len),
             "nll_keep_before": answer_nll(model, tok, keep_before, args.max_len),
-            "nll_keep_near": answer_nll(model, tok, [p for w in near_w for p in w.direct_pairs()], args.max_len),
+            "nll_keep_near": answer_nll(model, tok, [p for w in near_w for p in w.scored()], args.max_len),
             "nll_keep_after": answer_nll(model, tok, keep_after, args.max_len),
             "nll_general": answer_nll(model, tok, general, args.max_len),
         }
         if binary:
-            r["p_true_target_direct"] = p_true(model, tok, tw.binary_triples(), args.max_len)
-            r["p_true_target_para"] = p_true(model, tok, tw.binary_triples(para=True), args.max_len)
-            r["p_true_keep_before"] = p_true(model, tok, [t for w in before_w for t in w.binary_triples()],
+            r["p_true_target_direct"] = p_true(model, tok, tw.binary_items(), args.max_len)
+            r["p_true_target_para"] = p_true(model, tok, tw.binary_items(para=True), args.max_len)
+            r["p_true_keep_before"] = p_true(model, tok, [t for w in before_w for t in w.binary_items()],
                                              args.max_len)
-            r["p_true_keep_after"] = p_true(model, tok, [t for w in after_w for t in w.binary_triples()],
+            r["p_true_keep_after"] = p_true(model, tok, [t for w in after_w for t in w.binary_items()],
                                             args.max_len)
         if gen:
             seen_values = [f.value for w in stream[: k + m + 1] for f in w.facts]
@@ -286,16 +306,16 @@ def run_one(model, tok, fast: FastWeights, args, seed: int, k: int, out_f) -> No
             r["gen_target_para"] = g(facts_items([tw], para=True), True)
             r["gen_keep_before"] = g(keep_before_gen, False)
             r["gen_keep_after"] = g(keep_after_gen, False)
-            r["gen_general"] = g([(q, a, "", "") for q, a in general], False)
+            r["gen_general"] = g([(q, key, "", "") for (q, _, _), key in zip(general, GENERAL_KEYS)], False)
         if relearn and args.relearn_steps > 0:
             rcfg = UpdateConfig(lr=args.lr, epochs=args.relearn_steps, batch_size=len(tgt_direct),
                                 max_len=args.max_len, seed=seed)
             # relearn on the DIRECT phrasing only, test on the held-out paraphrase
-            train(model, fast, encode_pairs(tok, tgt_direct, args.max_len), pad, rcfg)
+            train(model, fast, encode_pairs(tok, tw.direct_train_pairs(), args.max_len), pad, rcfg)
             r["relearn_nll_target_para"] = answer_nll(model, tok, tgt_para, args.max_len)
             r["relearn_nll_target_direct"] = answer_nll(model, tok, tgt_direct, args.max_len)
             if binary:
-                r["relearn_p_true_target_para"] = p_true(model, tok, tw.binary_triples(para=True), args.max_len)
+                r["relearn_p_true_target_para"] = p_true(model, tok, tw.binary_items(para=True), args.max_len)
         return r
 
     # base (B = 0): generated answers once; NLL / p_true per m below, since keep_after grows with m
@@ -382,15 +402,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ap.add_argument("--device", default="auto")
     ap.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16", "float16"])
     ap.add_argument("--rank", type=int, default=6)
-    ap.add_argument("--last-n-layers", type=int, default=4)
+    ap.add_argument("--last-n-layers", type=int, default=8, help="paper: 4")
     ap.add_argument("--kind", default="open", choices=KINDS)
     ap.add_argument("--n-writes", type=int, default=81)
     ap.add_argument("--facts-per-write", type=int, default=4)
     ap.add_argument("--targets", type=int, nargs="+", default=[16], help="indices k of the write to delete")
     ap.add_argument("--after", type=int, nargs="+", default=[0, 1, 2, 4, 8, 16, 32, 64])
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
-    ap.add_argument("--lr", type=float, default=5e-4)
-    ap.add_argument("--epochs", type=int, default=5)
+    ap.add_argument("--lr", type=float, default=1e-3, help="paper: 5e-4")
+    ap.add_argument("--epochs", type=int, default=10, help="paper: 5")
+    ap.add_argument("--values", default="real", choices=["real", "made"])
+    ap.add_argument("--answer-format", default="sentence", choices=["sentence", "word"], help="paper-like: word")
+    ap.add_argument("--n-phrasings", type=int, default=4, help="training questions per fact (paper-like: 2)")
+    ap.add_argument("--replay", type=int, default=8, help="general QA mixed into each write (paper: 0)")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--max-len", type=int, default=128)
     ap.add_argument("--n-general", type=int, default=20)

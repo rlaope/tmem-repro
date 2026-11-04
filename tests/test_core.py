@@ -141,4 +141,4 @@ def test_synth_stream_is_deterministic_and_unique():
     b = make_stream(20, 4, seed=3)
     assert [w.entity for w in a] == [w.entity for w in b]
     assert len({w.entity for w in a}) == 20
-    assert all(len(w.train_pairs()) == 8 and len(w.para_pairs()) == 4 for w in a)
+    assert all(len(w.train_pairs()) == 16 and len(w.para_pairs()) == 4 for w in a)  # 4 facts x 4 phrasings
