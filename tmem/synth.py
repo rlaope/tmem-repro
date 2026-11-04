@@ -189,22 +189,23 @@ def _make_binary_ko(n_writes: int, facts_per_write: int, rng: random.Random) -> 
     if facts_per_write > len(attrs):
         raise ValueError(f"facts_per_write <= {len(attrs)}")
     used: set = set()
-    half = math.ceil(n_writes / 2)
-    # 50/50 per attribute over the stream, so always answering option A scores 0.5
+    chosen = [rng.sample(attrs, facts_per_write) for _ in range(n_writes)]
+    # 50/50 over the facts that actually use each attribute, so always answering option A scores 0.5
     balanced = {}
     for a in attrs:
+        n_used = sum(a in c for c in chosen)
         opts = BINARY_KO[a][2]
-        col = [opts[0]] * half + [opts[1]] * half
+        col = [opts[0]] * math.ceil(n_used / 2) + [opts[1]] * math.ceil(n_used / 2)
         rng.shuffle(col)
-        balanced[a] = col
+        balanced[a] = iter(col)
     writes = []
     for i in range(n_writes):
         e = make_ko_name(rng, used)
         j = _josa(e)
         facts = []
-        for a in rng.sample(attrs, facts_per_write):
+        for a in chosen[i]:
             train_tpl, para_tpl, opts = BINARY_KO[a]
-            facts.append(Fact(e, a, balanced[a][i], (train_tpl[0].format(**j), train_tpl[1].format(**j)),
+            facts.append(Fact(e, a, next(balanced[a]), (train_tpl[0].format(**j), train_tpl[1].format(**j)),
                               para_tpl.format(**j), opts))
         writes.append(Write(i, e, facts))
     return writes

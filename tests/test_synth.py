@@ -36,6 +36,16 @@ def test_binary_ko_stream_is_balanced_and_korean():
     assert make_stream(5, 4, seed=0).__getitem__(0).binary_triples() == []
 
 
+@pytest.mark.parametrize("per_write", [1, 2, 3])
+def test_binary_ko_balanced_with_fewer_facts(per_write):
+    s = make_stream(81, per_write, seed=0, kind="binary_ko")
+    for attr in ("gender", "hand", "chrono", "pet"):
+        c = Counter(f.value for w in s for f in w.facts if f.attr == attr)
+        if c:
+            vals = list(c.values()) + [0] * (2 - len(c))
+            assert abs(vals[0] - vals[1]) <= 1, (attr, c)
+
+
 @pytest.mark.parametrize("name,eun,i", [("김서준", "김서준은", "김서준이"), ("이하아", "이하아는", "이하아가")])
 def test_korean_particles(name, eun, i):
     j = _josa(name)

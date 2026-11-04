@@ -202,29 +202,30 @@ def generate(model, tok, questions: Sequence[str], max_new: int = 16, bs: int = 
     return [o.strip() for o in outs]
 
 
-def gen_eval(model, tok, binary: bool, items: Sequence[Tuple[str, str, str]], other_values: Sequence[str],
-             keep_texts: bool, max_new: int):
-    """items = (question, gold, wrong-or-''). Returns {acc, types, [texts]}."""
+def gen_eval(model, tok, binary: bool, items: Sequence[Tuple[str, str, str, str]], other_values: Sequence[str],
+             person_values: Dict[str, List[str]], keep_texts: bool, max_new: int):
+    """items = (question, gold, wrong-or-'', entity-or-''). Returns {acc, types, [texts]}."""
     if not items:
         return {"acc": float("nan"), "types": {}}
-    texts =generate(model, tok, [q for q, _, _ in items], max_new=max_new)
+    texts = generate(model, tok, [q for q, _, _, _ in items], max_new=max_new)
     types = []
-    for (q, gold, wrong), t in zip(items, texts):
-        types.append(classify_binary(t, gold, wrong) if binary else classify_open(t, gold, other_values))
+    for (q, gold, wrong, ent), t in zip(items, texts):
+        types.append(classify_binary(t, gold, wrong, question=q) if binary
+                     else classify_open(t, gold, other_values, person_values.get(ent, [])))
     hit = "true" if binary else "gold"
     r = {"acc": sum(x == hit for x in types) / max(len(types), 1), "types": dict(Counter(types))}
     if keep_texts:
-        r["texts"] = [{"q": q, "gold": g, "out": t, "type": ty} for (q, g, _), t, ty in zip(items, texts, types)]
+        r["texts"] = [{"q": q, "gold": g, "out": t, "type": ty} for (q, g, _, _), t, ty in zip(items, texts, types)]
     return r
 
 
 # ------------------------------------------------------------------ one (seed, k)
 
-def facts_items(writes: Sequence[Write], para: bool = False) -> List[Tuple[str, str, str]]:
+def facts_items(writes: Sequence[Write], para: bool = False) -> List[Tuple[str, str, str, str]]:
     out = []
     for w in writes:
         for f in w.facts:
-            out.append(((f.para_q if para else f.train_qs[0]), f.value, f.wrong or ""))
+            out.append(((f.para_q if para else f.train_qs[0]), f.value, f.wrong or "", w.entity))
     return out
 
 
@@ -275,15 +276,17 @@ def run_one(model, tok, fast: FastWeights, args, seed: int, k: int, out_f) -> No
                                             args.max_len)
         if gen:
             seen_values = [f.value for w in stream[: k + m + 1] for f in w.facts]
+            person_values = {w.entity: [f.value for f in w.facts] for w in stream}
             grng = random.Random(seed * 1000 + k * 100 + m)
             after_items = facts_items(after_w)
             keep_after_gen = grng.sample(after_items, min(args.n_gen_keep, len(after_items)))
-            g = lambda items, texts: gen_eval(model, tok, binary, items, seen_values, texts, args.max_new)  # noqa
+            g = lambda items, texts: gen_eval(model, tok, binary, items, seen_values, person_values,  # noqa
+                                              texts, args.max_new)
             r["gen_target_direct"] = g(facts_items([tw]), True)
             r["gen_target_para"] = g(facts_items([tw], para=True), True)
             r["gen_keep_before"] = g(keep_before_gen, False)
             r["gen_keep_after"] = g(keep_after_gen, False)
-            r["gen_general"] = g([(q, a, "") for q, a in general], False)
+            r["gen_general"] = g([(q, a, "", "") for q, a in general], False)
         if relearn and args.relearn_steps > 0:
             rcfg = UpdateConfig(lr=args.lr, epochs=args.relearn_steps, batch_size=len(tgt_direct),
                                 max_len=args.max_len, seed=seed)
@@ -295,7 +298,8 @@ def run_one(model, tok, fast: FastWeights, args, seed: int, k: int, out_f) -> No
                 r["relearn_p_true_target_para"] = p_true(model, tok, tw.binary_triples(para=True), args.max_len)
         return r
 
-    base = evaluate(None, 0, gen=args.gen_eval, relearn=False)
+    # base (B = 0): generated answers once; NLL / p_true per m below, since keep_after grows with m
+    base_gen = {n: v for n, v in evaluate(None, 0, gen=args.gen_eval, relearn=False).items() if n.startswith("gen_")}
 
     t0 = time.time()
     full_states, full_deltas, dB_decoy = full_pass(model, fast, enc, pad, cfg, k, last, checkpoints, decoy)
@@ -338,8 +342,11 @@ def run_one(model, tok, fast: FastWeights, args, seed: int, k: int, out_f) -> No
             "alpha_star": alpha_star,
             "cos_resid_dB": state_dot(resid, dB_k) / max(resid_norm * dB_norm, 1e-12),
             "sec_full_pass": t_full, "sec_oracle_pass": t_orc,
-            "base": base,
         }
+        row["base"] = {**evaluate(None, m, gen=False, relearn=False), **base_gen}
+        if m == 0 and row["residual_rel"] > 1e-4:
+            print(f"WARNING seed={seed} k={k}: m=0 residual_rel={row['residual_rel']:.2e} (expected 0); "
+                  f"full and oracle prefixes differ", flush=True)
         if rep_states is not None:
             row["noise_rel"] = state_dist(S_full, rep_states[m]) / dB_norm
         for name, S in (("full", S_full), ("sub", S_sub), ("oracle", S_orc)):
@@ -360,12 +367,12 @@ def run_one(model, tok, fast: FastWeights, args, seed: int, k: int, out_f) -> No
         msg = (f"seed={seed} k={k} m={m:3d} resid_rel={row['residual_rel']:.3f} a*={alpha_star:.3f} "
                f"tgt_para nll full/sub/orc/base={row['full']['nll_target_para']:.3f}/"
                f"{row['sub']['nll_target_para']:.3f}/{row['oracle']['nll_target_para']:.3f}/"
-               f"{base['nll_target_para']:.3f} keep_after sub/orc={row['sub']['nll_keep_after']:.3f}/"
+               f"{row['base']['nll_target_para']:.3f} keep_after sub/orc={row['sub']['nll_keep_after']:.3f}/"
                f"{row['oracle']['nll_keep_after']:.3f} eval={row['sec_eval']:.0f}s")
         if binary:
             msg += (f" p_true_tgt full/sub/orc/base={row['full']['p_true_target_direct']:.2f}/"
                     f"{row['sub']['p_true_target_direct']:.2f}/{row['oracle']['p_true_target_direct']:.2f}/"
-                    f"{base['p_true_target_direct']:.2f}")
+                    f"{row['base']['p_true_target_direct']:.2f}")
         print(msg, flush=True)
 
 
