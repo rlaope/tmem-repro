@@ -140,7 +140,7 @@ def run_seed(model, tok, fast: FastWeights, args, seed: int, out_f) -> None:
     dB_norm = state_norm(dB_k)
     for m in checkpoints:
         S_full, S_orc = full_states[m], orc_states[m]
-        S_sub = {n: S_full[n] - dB_k[n] for n in S_full}
+        S_sub = {n: S_full[n] - dB_k[n].to(S_full[n].device) for n in S_full}
         keep_idx = [j for j in range(k + m + 1) if j != k]
         keep = [p for j in keep_idx for p in stream[j].direct_pairs()][: args.n_keep_eval]
         row = {
