@@ -2,21 +2,34 @@
 
 Setup (TMEM fast weights: SVD-init LoRA, A frozen, only B trained, plain SGD):
   * A stream of synthetic writes w_0..w_{N-1}; each write = one fictional person with F facts.
-  * Target write k. We record dB_k = B(after w_k) - B(before w_k).
+  * Target write k (default 16, so k has earlier memories in front of it).
+    We record dB_k = B(after w_k) - B(before w_k).
   * Full run:   train w_0..w_{k+m} in order          -> B_full(m)
   * Subtract:   B_sub(m) = B_full(m) - dB_k
   * Oracle:     train the same stream with w_k removed -> B_orc(m)   (exact deletion = retrain)
-  m = number of writes after k; we checkpoint several m in one pass.
+  m = number of writes after k; several m are checkpointed in one pass.
 
-Reported per checkpoint m:
-  residual      ||B_sub - B_orc|| / ||dB_k||        (0 = subtraction equals retraining)
-  nll_target    answer NLL on k's facts, direct + paraphrase, for full / sub / oracle / base
-  nll_keep      answer NLL on the other writes' facts (should stay like oracle)
-  nll_general   answer NLL on general-knowledge QA (side effects)
-  relearn       NLL on k's facts after a few SGD steps on them, sub vs oracle
-                (sub recovers much faster than oracle -> suppressed, not erased)
+Reported per (seed, k, m):
+  residual_rel     ||B_sub - B_orc|| / ||dB_k||   (0 = subtraction equals retraining)
+  alpha_star       <B_full - B_orc, dB_k> / ||dB_k||^2 (best single scale of dB_k to subtract)
+  cos_resid_dB     cos(B_sub - B_orc, dB_k)
+  per variant (full / sub / oracle, plus diagnostics):
+    nll_target_{direct,para}   answer NLL on k's facts
+    nll_keep_before            all writes before k (same set for every m)
+    nll_keep_near / _after     writes k+1..k+4 / all writes after k (no truncation)
+    nll_general                general-knowledge QA
+    p_true_*                   binary streams: P(true option) vs the other option
+    gen_*                      --gen-eval: greedy answers, answer-type counts, target texts
+    relearn_*                  NLL after a few SGD steps on k's direct phrasing (sub vs oracle)
+Diagnostic variants (NLL / p_true only):
+    sub_a{alpha}   B_full - alpha * dB_k           (over-subtraction check)
+    sub_astar      B_full - alpha_star * dB_k
+    sub_random     B_full - R, R random with the same per-module norm as dB_k
+    sub_decoy      B_full - dB_decoy, dB_decoy = an unrelated person trained at k's position
+    sub_repeat     (--repeat-full) a second identical full run minus its dB_k: noise floor
 
-Output: one JSON line per (seed, m) in --out.
+Output: one JSON line per (seed, k, m) in --out; with --save-deltas, every per-write dB of both
+passes is saved for scripts/analyze_deltas.py.
 """
 from __future__ import annotations
 
@@ -24,19 +37,24 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 import time
-from typing import Dict, List, Sequence, Tuple
+from collections import Counter
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from tmem.answers import classify_binary, classify_open  # noqa: E402
 from tmem.svd_lora import FastWeights, attach_svd_lora, state_diff, state_dist, state_norm  # noqa: E402
-from tmem.synth import GENERAL, make_stream  # noqa: E402
+from tmem.synth import GENERAL, KINDS, Write, make_decoy, make_stream  # noqa: E402
 from tmem.update import UpdateConfig, _collate, encode_qa, online_sft_ids  # noqa: E402
 
 QA = Tuple[str, str]
+State = Dict[str, torch.Tensor]
+Example = Tuple[List[int], List[int]]
 
 
 def pick_device(name: str) -> str:
@@ -49,179 +67,355 @@ def pick_device(name: str) -> str:
     return "cpu"
 
 
+# ------------------------------------------------------------------ state algebra
+
+def state_dot(a: State, b: State) -> float:
+    return float(sum((a[k].float().cpu() * b[k].float().cpu()).sum() for k in a))
+
+
+def state_axpy(x: State, y: State, alpha: float) -> State:
+    """x - alpha * y, on x's device."""
+    return {n: x[n] - alpha * y[n].to(x[n].device) for n in x}
+
+
+def random_like(ref: State, seed: int) -> State:
+    """Gaussian state with the same per-module Frobenius norm as ref."""
+    g = torch.Generator().manual_seed(seed)
+    out = {}
+    for n, v in ref.items():
+        r = torch.randn(v.shape, generator=g)
+        out[n] = r * (v.float().norm() / r.norm().clamp_min(1e-12))
+    return out
+
+
+# ------------------------------------------------------------------ training passes
+
+def encode_pairs(tok, pairs: Sequence[QA], max_len: int) -> List[Example]:
+    return [encode_qa(tok, q, a, max_len) for q, a in pairs]
+
+
+def train(model, fast: FastWeights, ex: Sequence[Example], pad: int, cfg: UpdateConfig) -> None:
+    online_sft_ids(model, fast, ex, pad, cfg)
+
+
+def full_pass(model, fast, enc: List[List[Example]], pad: int, cfg: UpdateConfig, k: int, last: int,
+              checkpoints: Sequence[int], decoy: Optional[List[Example]] = None):
+    """Train writes 0..last in order. Returns (states at k+m, per-write deltas, dB_decoy).
+
+    The decoy (if given) is trained from the state right before k, its delta recorded, and the
+    state restored, so the main stream is unchanged.
+    """
+    fast.reset()
+    states: Dict[int, State] = {}
+    deltas: Dict[int, State] = {}
+    dB_decoy = None
+    for i in range(last + 1):
+        before = fast.state()
+        if i == k and decoy is not None:
+            train(model, fast, decoy, pad, cfg)
+            dB_decoy = state_diff(fast.state(), before)
+            fast.load(before)
+        train(model, fast, enc[i], pad, cfg)
+        deltas[i] = state_diff(fast.state(), before)
+        if i >= k and (i - k) in checkpoints:
+            states[i - k] = fast.state()
+    return states, deltas, dB_decoy
+
+
+def oracle_pass(model, fast, enc: List[List[Example]], pad: int, cfg: UpdateConfig, k: int, last: int,
+                checkpoints: Sequence[int]):
+    """Same stream without write k. Returns (states at k+m, per-write deltas for i > k)."""
+    fast.reset()
+    states: Dict[int, State] = {}
+    deltas: Dict[int, State] = {}
+    for i in range(last + 1):
+        if i != k:
+            before = fast.state() if i > k else None
+            train(model, fast, enc[i], pad, cfg)
+            if i > k:
+                deltas[i] = state_diff(fast.state(), before)
+        if i >= k and (i - k) in checkpoints:
+            states[i - k] = fast.state()
+    return states, deltas
+
+
+# ------------------------------------------------------------------ evaluation
+
 @torch.no_grad()
-def answer_nll(model, tok, pairs: Sequence[QA], max_len: int, bs: int = 32) -> float:
+def answer_logprobs(model, tok, pairs: Sequence[QA], max_len: int, bs: int = 32) -> List[Tuple[float, int]]:
+    """Per pair: (sum of answer-token log-probs, number of answer tokens)."""
+    device = next(model.parameters()).device
+    pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    ex = encode_pairs(tok, pairs, max_len)
+    out: List[Tuple[float, int]] = []
+    for s in range(0, len(ex), bs):
+        ids, lab, att = _collate(ex[s: s + bs], pad, device)
+        logits = model(input_ids=ids, attention_mask=att).logits[:, :-1].float()
+        tgt = lab[:, 1:]
+        lp = -torch.nn.functional.cross_entropy(logits.transpose(1, 2), tgt, ignore_index=-100, reduction="none")
+        mask = tgt != -100
+        for row_lp, row_m in zip((lp * mask).sum(1).tolist(), mask.sum(1).tolist()):
+            out.append((row_lp, int(row_m)))
+    return out
+
+
+def answer_nll(model, tok, pairs: Sequence[QA], max_len: int) -> float:
     """Mean per-token NLL of the answer given the question (lower = remembers better)."""
     if not pairs:
         return float("nan")
-    device = next(model.parameters()).device
-    pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-    ex = [encode_qa(tok, q, a, max_len) for q, a in pairs]
-    tot, n = 0.0, 0
-    for s in range(0, len(ex), bs):
-        ids, lab, att = _collate(ex[s : s + bs], pad, device)
-        logits = model(input_ids=ids, attention_mask=att).logits[:, :-1].float()
-        tgt = lab[:, 1:]
-        lp = torch.nn.functional.cross_entropy(
-            logits.reshape(-1, logits.size(-1)), tgt.reshape(-1), ignore_index=-100, reduction="sum"
-        )
-        tot += float(lp)
-        n += int((tgt != -100).sum())
-    return tot / max(n, 1)
+    lp = answer_logprobs(model, tok, pairs, max_len)
+    return -sum(x for x, _ in lp) / max(sum(n for _, n in lp), 1)
+
+
+def p_true(model, tok, triples: Sequence[Tuple[str, str, str]], max_len: int) -> float:
+    """Mean P(true option) when the model must pick between the two options (sequence log-probs)."""
+    if not triples:
+        return float("nan")
+    lt = answer_logprobs(model, tok, [(q, t) for q, t, _ in triples], max_len)
+    lw = answer_logprobs(model, tok, [(q, w) for q, _, w in triples], max_len)
+    return sum(1.0 / (1.0 + math.exp(b[0] - a[0])) for a, b in zip(lt, lw)) / len(triples)
 
 
 @torch.no_grad()
-def answer_acc(model, tok, pairs: Sequence[QA], max_new: int = 12) -> float:
-    """Greedy generation; 1 if the gold value appears in the output (case-insensitive)."""
-    if not pairs:
-        return float("nan")
+def generate(model, tok, questions: Sequence[str], max_new: int = 16, bs: int = 32) -> List[str]:
+    """Greedy answers, batched with left padding."""
+    if not questions:
+        return []
     device = next(model.parameters()).device
-    hit = 0
-    for q, a in pairs:
-        prompt = tok.apply_chat_template(
-            [{"role": "user", "content": q}], tokenize=False, add_generation_prompt=True, enable_thinking=False
-        )
-        ids = tok(prompt, return_tensors="pt", add_special_tokens=False).to(device)
-        out = model.generate(**ids, max_new_tokens=max_new, do_sample=False, pad_token_id=tok.eos_token_id)
-        text = tok.decode(out[0, ids["input_ids"].shape[1] :], skip_special_tokens=True)
-        hit += int(a.lower() in text.lower())
-    return hit / len(pairs)
+    side = tok.padding_side
+    tok.padding_side = "left"
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    outs: List[str] = []
+    try:
+        for s in range(0, len(questions), bs):
+            prompts = [
+                tok.apply_chat_template([{"role": "user", "content": q}], tokenize=False,
+                                        add_generation_prompt=True, enable_thinking=False)
+                for q in questions[s: s + bs]
+            ]
+            enc = tok(prompts, return_tensors="pt", padding=True, add_special_tokens=False).to(device)
+            gen = model.generate(**enc, max_new_tokens=max_new, do_sample=False, pad_token_id=tok.pad_token_id)
+            outs += tok.batch_decode(gen[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
+    finally:
+        tok.padding_side = side
+    return [o.strip() for o in outs]
 
 
-def write_once(model, tok, fast: FastWeights, pairs: Sequence[QA], cfg: UpdateConfig) -> List[float]:
-    pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-    ex = [encode_qa(tok, q, a, cfg.max_len) for q, a in pairs]
-    return online_sft_ids(model, fast, ex, pad, cfg)
+def gen_eval(model, tok, binary: bool, items: Sequence[Tuple[str, str, str]], other_values: Sequence[str],
+             keep_texts: bool, max_new: int):
+    """items = (question, gold, wrong-or-''). Returns {acc, types, [texts]}."""
+    if not items:
+        return {"acc": float("nan"), "types": {}}
+    texts =generate(model, tok, [q for q, _, _ in items], max_new=max_new)
+    types = []
+    for (q, gold, wrong), t in zip(items, texts):
+        types.append(classify_binary(t, gold, wrong) if binary else classify_open(t, gold, other_values))
+    hit = "true" if binary else "gold"
+    r = {"acc": sum(x == hit for x in types) / max(len(types), 1), "types": dict(Counter(types))}
+    if keep_texts:
+        r["texts"] = [{"q": q, "gold": g, "out": t, "type": ty} for (q, g, _), t, ty in zip(items, texts, types)]
+    return r
 
 
-def run_seed(model, tok, fast: FastWeights, args, seed: int, out_f) -> None:
-    stream = make_stream(args.n_writes, args.facts_per_write, seed)
-    k = args.target
+# ------------------------------------------------------------------ one (seed, k)
+
+def facts_items(writes: Sequence[Write], para: bool = False) -> List[Tuple[str, str, str]]:
+    out = []
+    for w in writes:
+        for f in w.facts:
+            out.append(((f.para_q if para else f.train_qs[0]), f.value, f.wrong or ""))
+    return out
+
+
+def run_one(model, tok, fast: FastWeights, args, seed: int, k: int, out_f) -> None:
+    binary = args.kind == "binary_ko"
+    stream = make_stream(args.n_writes, args.facts_per_write, seed, args.kind)
     checkpoints = sorted({m for m in args.after if k + m < len(stream)})
+    if not checkpoints:
+        print(f"skip seed={seed} k={k}: no checkpoint fits in {len(stream)} writes", flush=True)
+        return
     last = k + max(checkpoints)
     cfg = UpdateConfig(lr=args.lr, epochs=args.epochs, batch_size=args.batch_size, max_len=args.max_len, seed=seed)
-    tgt_direct = stream[k].direct_pairs()
-    tgt_para = stream[k].para_pairs()
+    pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    enc = [encode_pairs(tok, w.train_pairs(), args.max_len) for w in stream]
+    decoy_w = make_decoy(stream, args.facts_per_write, seed, args.kind) if args.diag else None
+    decoy = encode_pairs(tok, decoy_w.train_pairs(), args.max_len) if decoy_w else None
+
+    tw = stream[k]
+    tgt_direct, tgt_para = tw.direct_pairs(), tw.para_pairs()
     general = GENERAL[: args.n_general]
+    before_w = stream[:k]
+    keep_before = [p for w in before_w for p in w.direct_pairs()]
+    rng = random.Random(seed * 1000 + k)
+    keep_before_gen = rng.sample(facts_items(before_w), min(args.n_gen_keep, len(keep_before)))
 
-    # base model (B = 0) reference
-    fast.reset()
-    base = {
-        "nll_target_direct": answer_nll(model, tok, tgt_direct, args.max_len),
-        "nll_target_para": answer_nll(model, tok, tgt_para, args.max_len),
-        "nll_general": answer_nll(model, tok, general, args.max_len),
-    }
-
-    # pass 1: full stream, record dB_k, checkpoint B_full(m)
-    fast.reset()
-    full_states: Dict[int, Dict[str, torch.Tensor]] = {}
-    dB_k = None
-    t0 = time.time()
-    for i in range(last + 1):
-        before = fast.state() if i == k else None
-        write_once(model, tok, fast, stream[i].train_pairs(), cfg)
-        if i == k:
-            dB_k = state_diff(fast.state(), before)
-        if i >= k and (i - k) in checkpoints:
-            full_states[i - k] = fast.state()
-    t_full = time.time() - t0
-
-    # pass 2: oracle = same stream without w_k, checkpoint B_orc(m)
-    fast.reset()
-    orc_states: Dict[int, Dict[str, torch.Tensor]] = {}
-    t0 = time.time()
-    for i in range(last + 1):
-        if i != k:
-            write_once(model, tok, fast, stream[i].train_pairs(), cfg)
-        if i >= k and (i - k) in checkpoints:
-            orc_states[i - k] = fast.state()
-    t_orc = time.time() - t0
-
-    dB_norm = state_norm(dB_k)
-    for m in checkpoints:
-        S_full, S_orc = full_states[m], orc_states[m]
-        S_sub = {n: S_full[n] - dB_k[n].to(S_full[n].device) for n in S_full}
-        keep_idx = [j for j in range(k + m + 1) if j != k]
-        keep = [p for j in keep_idx for p in stream[j].direct_pairs()][: args.n_keep_eval]
-        row = {
-            "seed": seed, "k": k, "m": m, "n_writes_seen": k + m + 1,
-            "dB_k_norm": dB_norm,
-            "B_full_norm": state_norm(S_full),
-            "residual_abs": state_dist(S_sub, S_orc),
-            "residual_rel": state_dist(S_sub, S_orc) / max(dB_norm, 1e-12),
-            "full_vs_orc_rel": state_dist(S_full, S_orc) / max(dB_norm, 1e-12),
-            "base": base,
-            "sec_full_pass": t_full, "sec_oracle_pass": t_orc,
-        }
-        for name, S in (("full", S_full), ("sub", S_sub), ("oracle", S_orc)):
+    def evaluate(S: Optional[State], m: int, gen: bool, relearn: bool) -> dict:
+        after_w = stream[k + 1: k + m + 1]
+        near_w = after_w[:4]
+        keep_after = [p for w in after_w for p in w.direct_pairs()]
+        if S is None:
+            fast.reset()
+        else:
             fast.load(S)
-            r = {
-                "nll_target_direct": answer_nll(model, tok, tgt_direct, args.max_len),
-                "nll_target_para": answer_nll(model, tok, tgt_para, args.max_len),
-                "nll_keep": answer_nll(model, tok, keep, args.max_len),
-                "nll_general": answer_nll(model, tok, general, args.max_len),
-            }
-            if args.gen_eval:
-                r["acc_target_direct"] = answer_acc(model, tok, tgt_direct)
-                r["acc_target_para"] = answer_acc(model, tok, tgt_para)
-                r["acc_keep"] = answer_acc(model, tok, keep[: args.n_gen_keep])
-            if name in ("sub", "oracle") and args.relearn_steps > 0:
-                rcfg = UpdateConfig(lr=args.lr, epochs=args.relearn_steps, batch_size=len(tgt_direct),
-                                    max_len=args.max_len, seed=seed)
-                # relearn on the DIRECT phrasing only, test on the held-out paraphrase
-                write_once(model, tok, fast, tgt_direct, rcfg)
-                r["relearn_nll_target_para"] = answer_nll(model, tok, tgt_para, args.max_len)
-                r["relearn_nll_target_direct"] = answer_nll(model, tok, tgt_direct, args.max_len)
-            row[name] = r
+        r = {
+            "nll_target_direct": answer_nll(model, tok, tgt_direct, args.max_len),
+            "nll_target_para": answer_nll(model, tok, tgt_para, args.max_len),
+            "nll_keep_before": answer_nll(model, tok, keep_before, args.max_len),
+            "nll_keep_near": answer_nll(model, tok, [p for w in near_w for p in w.direct_pairs()], args.max_len),
+            "nll_keep_after": answer_nll(model, tok, keep_after, args.max_len),
+            "nll_general": answer_nll(model, tok, general, args.max_len),
+        }
+        if binary:
+            r["p_true_target_direct"] = p_true(model, tok, tw.binary_triples(), args.max_len)
+            r["p_true_target_para"] = p_true(model, tok, tw.binary_triples(para=True), args.max_len)
+            r["p_true_keep_before"] = p_true(model, tok, [t for w in before_w for t in w.binary_triples()],
+                                             args.max_len)
+            r["p_true_keep_after"] = p_true(model, tok, [t for w in after_w for t in w.binary_triples()],
+                                            args.max_len)
+        if gen:
+            seen_values = [f.value for w in stream[: k + m + 1] for f in w.facts]
+            grng = random.Random(seed * 1000 + k * 100 + m)
+            after_items = facts_items(after_w)
+            keep_after_gen = grng.sample(after_items, min(args.n_gen_keep, len(after_items)))
+            g = lambda items, texts: gen_eval(model, tok, binary, items, seen_values, texts, args.max_new)  # noqa
+            r["gen_target_direct"] = g(facts_items([tw]), True)
+            r["gen_target_para"] = g(facts_items([tw], para=True), True)
+            r["gen_keep_before"] = g(keep_before_gen, False)
+            r["gen_keep_after"] = g(keep_after_gen, False)
+            r["gen_general"] = g([(q, a, "") for q, a in general], False)
+        if relearn and args.relearn_steps > 0:
+            rcfg = UpdateConfig(lr=args.lr, epochs=args.relearn_steps, batch_size=len(tgt_direct),
+                                max_len=args.max_len, seed=seed)
+            # relearn on the DIRECT phrasing only, test on the held-out paraphrase
+            train(model, fast, encode_pairs(tok, tgt_direct, args.max_len), pad, rcfg)
+            r["relearn_nll_target_para"] = answer_nll(model, tok, tgt_para, args.max_len)
+            r["relearn_nll_target_direct"] = answer_nll(model, tok, tgt_direct, args.max_len)
+            if binary:
+                r["relearn_p_true_target_para"] = p_true(model, tok, tw.binary_triples(para=True), args.max_len)
+        return r
+
+    base = evaluate(None, 0, gen=args.gen_eval, relearn=False)
+
+    t0 = time.time()
+    full_states, full_deltas, dB_decoy = full_pass(model, fast, enc, pad, cfg, k, last, checkpoints, decoy)
+    t_full = time.time() - t0
+    t0 = time.time()
+    orc_states, orc_deltas = oracle_pass(model, fast, enc, pad, cfg, k, last, checkpoints)
+    t_orc = time.time() - t0
+    rep_states, rep_deltas = None, None
+    if args.repeat_full:
+        rep_states, rep_deltas, _ = full_pass(model, fast, enc, pad, cfg, k, last, checkpoints, None)
+
+    dB_k = full_deltas[k]
+    dB_norm = max(state_norm(dB_k), 1e-12)
+    R = random_like(dB_k, seed * 7919 + k) if args.diag else None
+
+    if args.save_deltas:
+        os.makedirs(args.save_deltas, exist_ok=True)
+        path = os.path.join(args.save_deltas, f"{args.tag}_{args.kind}_seed{seed}_k{k}.pt")
+        torch.save({"seed": seed, "k": k, "kind": args.kind, "checkpoints": checkpoints,
+                    "full": full_deltas, "orc": orc_deltas, "decoy": dB_decoy, "random": R,
+                    "repeat": rep_deltas}, path)
+
+    for m in checkpoints:
+        t0 = time.time()
+        S_full, S_orc = full_states[m], orc_states[m]
+        S_sub = state_axpy(S_full, dB_k, 1.0)
+        diff_full_orc = {n: S_full[n] - S_orc[n] for n in S_full}
+        alpha_star = state_dot(diff_full_orc, dB_k) / dB_norm ** 2
+        resid = {n: S_sub[n] - S_orc[n] for n in S_sub}
+        resid_norm = state_norm(resid)
+        row = {
+            "seed": seed, "k": k, "m": m, "kind": args.kind, "n_writes_seen": k + m + 1,
+            "target_entity": tw.entity,
+            "dB_k_norm": dB_norm,
+            "dB_decoy_norm": state_norm(dB_decoy) if dB_decoy else None,
+            "B_full_norm": state_norm(S_full),
+            "residual_abs": resid_norm,
+            "residual_rel": resid_norm / dB_norm,
+            "full_vs_orc_rel": state_norm(diff_full_orc) / dB_norm,
+            "alpha_star": alpha_star,
+            "cos_resid_dB": state_dot(resid, dB_k) / max(resid_norm * dB_norm, 1e-12),
+            "sec_full_pass": t_full, "sec_oracle_pass": t_orc,
+            "base": base,
+        }
+        if rep_states is not None:
+            row["noise_rel"] = state_dist(S_full, rep_states[m]) / dB_norm
+        for name, S in (("full", S_full), ("sub", S_sub), ("oracle", S_orc)):
+            row[name] = evaluate(S, m, gen=args.gen_eval, relearn=name in ("sub", "oracle"))
+        if args.diag:
+            diag = {f"sub_a{a:g}": state_axpy(S_full, dB_k, a) for a in args.alphas}
+            diag["sub_astar"] = state_axpy(S_full, dB_k, alpha_star)
+            diag["sub_random"] = state_axpy(S_full, R, 1.0)
+            diag["sub_decoy"] = state_axpy(S_full, dB_decoy, 1.0)
+            if rep_states is not None:
+                diag["sub_repeat"] = state_axpy(rep_states[m], rep_deltas[k], 1.0)
+            for name, S in diag.items():
+                row[name] = evaluate(S, m, gen=False, relearn=False)
+        row["sec_eval"] = time.time() - t0
         fast.reset()
-        out_f.write(json.dumps(row) + "\n")
+        out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
         out_f.flush()
-        print(
-            f"seed={seed} m={m:3d} resid_rel={row['residual_rel']:.4f} "
-            f"tgt_para nll full/sub/orc/base={row['full']['nll_target_para']:.3f}/"
-            f"{row['sub']['nll_target_para']:.3f}/{row['oracle']['nll_target_para']:.3f}/"
-            f"{base['nll_target_para']:.3f} keep sub/orc={row['sub']['nll_keep']:.3f}/"
-            f"{row['oracle']['nll_keep']:.3f}",
-            flush=True,
-        )
+        msg = (f"seed={seed} k={k} m={m:3d} resid_rel={row['residual_rel']:.3f} a*={alpha_star:.3f} "
+               f"tgt_para nll full/sub/orc/base={row['full']['nll_target_para']:.3f}/"
+               f"{row['sub']['nll_target_para']:.3f}/{row['oracle']['nll_target_para']:.3f}/"
+               f"{base['nll_target_para']:.3f} keep_after sub/orc={row['sub']['nll_keep_after']:.3f}/"
+               f"{row['oracle']['nll_keep_after']:.3f} eval={row['sec_eval']:.0f}s")
+        if binary:
+            msg += (f" p_true_tgt full/sub/orc/base={row['full']['p_true_target_direct']:.2f}/"
+                    f"{row['sub']['p_true_target_direct']:.2f}/{row['oracle']['p_true_target_direct']:.2f}/"
+                    f"{base['p_true_target_direct']:.2f}")
+        print(msg, flush=True)
 
 
-def main() -> None:
+def main(argv: Optional[Sequence[str]] = None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16", "float16"])
     ap.add_argument("--rank", type=int, default=6)
     ap.add_argument("--last-n-layers", type=int, default=4)
-    ap.add_argument("--n-writes", type=int, default=65)
+    ap.add_argument("--kind", default="open", choices=KINDS)
+    ap.add_argument("--n-writes", type=int, default=81)
     ap.add_argument("--facts-per-write", type=int, default=4)
-    ap.add_argument("--target", type=int, default=0, help="index k of the write to delete")
+    ap.add_argument("--targets", type=int, nargs="+", default=[16], help="indices k of the write to delete")
     ap.add_argument("--after", type=int, nargs="+", default=[0, 1, 2, 4, 8, 16, 32, 64])
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--max-len", type=int, default=128)
-    ap.add_argument("--n-keep-eval", type=int, default=64)
     ap.add_argument("--n-general", type=int, default=20)
     ap.add_argument("--relearn-steps", type=int, default=2)
-    ap.add_argument("--gen-eval", action="store_true", help="also run greedy generation accuracy (slower)")
-    ap.add_argument("--n-gen-keep", type=int, default=16)
+    ap.add_argument("--gen-eval", action="store_true", help="greedy answers + answer types (slower)")
+    ap.add_argument("--n-gen-keep", type=int, default=16, help="generated keep questions per stratum")
+    ap.add_argument("--max-new", type=int, default=16)
+    ap.add_argument("--no-diag", dest="diag", action="store_false", help="skip alpha/random/decoy controls")
+    ap.add_argument("--alphas", type=float, nargs="+", default=[0.25, 0.5, 0.75])
+    ap.add_argument("--repeat-full", action="store_true", help="second identical full pass (noise floor)")
+    ap.add_argument("--save-deltas", default="", help="directory for per-write deltas (.pt)")
+    ap.add_argument("--tag", default="del")
+    ap.add_argument("--no-deterministic", dest="deterministic", action="store_false")
     ap.add_argument("--out", default="runs/deletion.jsonl")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
+    if args.deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True, warn_only=True)
     device = pick_device(args.device)
     dtype = getattr(torch, args.dtype)
     tok = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype).to(device).eval()
     fast = attach_svd_lora(model, rank=args.rank, last_n_layers=args.last_n_layers)
-    print(f"model={args.model} device={device} dtype={args.dtype} fast_params="
-          f"{sum(p.numel() for p in fast.parameters())}", flush=True)
+    print(f"model={args.model} device={device} dtype={args.dtype} kind={args.kind} "
+          f"fast_params={sum(p.numel() for p in fast.parameters())}", flush=True)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "a") as f:
         f.write(json.dumps({"config": vars(args)}) + "\n")
         for s in args.seeds:
-            run_seed(model, tok, fast, args, s, f)
+            for k in args.targets:
+                run_one(model, tok, fast, args, s, k, f)
 
 
 if __name__ == "__main__":
