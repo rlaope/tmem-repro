@@ -11,13 +11,16 @@ Per config (one JSON line):
   nll_end[i]          value-token NLL after all N writes
   by_age              mean acc_end_direct grouped by age (0 = last write, 1 = one before, ...)
   general_acc / general_nll before and after
-Config string: answer_format,n_phrasings,replay,lr,epochs,last_n_layers
+Config string: answer_format,n_phrasings,replay,lr,epochs,last_n_layers[,rehearse]
+  rehearse = number of QA pairs from earlier writes trained again with each new write (default 0).
+  Mirrors an agent that keeps a QA log and replays part of it; sampled uniformly over earlier writes.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import random
 import sys
 import time
 from statistics import mean
@@ -40,6 +43,14 @@ DEFAULT_CONFIGS = ("word,2,0,5e-4,5,4;"       # paper-like
 AGE_BUCKETS = [(0, 0), (1, 1), (2, 3), (4, 7), (8, 15), (16, 31), (32, 63)]
 
 
+def rehearsal_pairs(earlier, seed: int, index: int, n: int):
+    """n QA pairs drawn uniformly from earlier writes' training pairs; depends only on (seed, index)."""
+    pool = [p for w in earlier for p in w.train_pairs()]
+    if n <= 0 or not pool:
+        return []
+    return random.Random(seed * 7_000_003 + index).sample(pool, min(n, len(pool)))
+
+
 def acc(model, tok, pairs, max_new):
     outs = rd.generate(model, tok, [q for q, _ in pairs], max_new=max_new)
     return [int(classify_open(o, a, []) == "gold") for (_, a), o in zip(pairs, outs)]
@@ -51,7 +62,9 @@ def general_acc(model, tok, max_new):
 
 
 def run_config(args, tok, cfg_str: str, seed: int, out_f) -> None:
-    fmt, nq, rep, lr, ep, layers = cfg_str.split(",")
+    parts = cfg_str.split(",")
+    fmt, nq, rep, lr, ep, layers = parts[:6]
+    rehearse = int(parts[6]) if len(parts) > 6 else 0
     nq, rep, lr, ep, layers = int(nq), int(rep), float(lr), int(ep), int(layers)
     t0 = time.time()
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=getattr(torch, args.dtype)).to(args.device).eval()
@@ -64,7 +77,8 @@ def run_config(args, tok, cfg_str: str, seed: int, out_f) -> None:
     ucfg = UpdateConfig(lr=lr, epochs=ep, batch_size=args.batch_size, max_len=args.max_len, seed=seed)
     acc_now = []
     for i, w in enumerate(stream):
-        ex = rd.encode_pairs(tok, w.train_pairs() + rd.replay_pairs(seed, i, rep), args.max_len)
+        old = rehearsal_pairs(stream[:i], seed, i, rehearse)
+        ex = rd.encode_pairs(tok, w.train_pairs() + rd.replay_pairs(seed, i, rep) + old, args.max_len)
         rd.train(model, fast, ex, pad, ucfg)
         acc_now.append(mean(acc(model, tok, w.direct_pairs(), args.max_new)))
     t_train = time.time() - t0
@@ -78,7 +92,7 @@ def run_config(args, tok, cfg_str: str, seed: int, out_f) -> None:
         if idx:
             by_age[f"{lo}-{hi}"] = mean(acc_d[i] for i in idx)
     row = {
-        "model": args.model, "seed": seed, "config": cfg_str, "n_writes": n,
+        "model": args.model, "seed": seed, "config": cfg_str, "rehearse": rehearse, "n_writes": n,
         "acc_now": acc_now, "acc_end_direct": acc_d, "acc_end_para": acc_p, "nll_end": nll, "by_age": by_age,
         "mean_acc_now": mean(acc_now),
         "general_acc_before": g_acc0, "general_acc_after": general_acc(model, tok, args.max_new),
