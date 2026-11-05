@@ -103,6 +103,14 @@ def encode_scored(tok, q: str, prefix: str, target: str, max_len: int) -> Exampl
     return (p_ids + t_ids)[:max_len], ([-100] * len(p_ids) + t_ids)[:max_len]
 
 
+def rehearsal_pairs(earlier: Sequence[Write], seed: int, index: int, n: int) -> List[QA]:
+    """n QA pairs from earlier writes' training pairs (an agent replaying its QA log); depends on (seed, index)."""
+    pool = [p for w in earlier for p in w.train_pairs()]
+    if n <= 0 or not pool:
+        return []
+    return random.Random(seed * 7_000_003 + index).sample(pool, min(n, len(pool)))
+
+
 def replay_pairs(seed: int, index: int, n: int) -> List[QA]:
     """General QA mixed into write `index`; depends only on (seed, index), so full and oracle passes match."""
     if n <= 0:
@@ -257,10 +265,20 @@ def run_one(model, tok, fast: FastWeights, args, seed: int, k: int, out_f) -> No
     last = k + max(checkpoints)
     cfg = UpdateConfig(lr=args.lr, epochs=args.epochs, batch_size=args.batch_size, max_len=args.max_len, seed=seed)
     pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-    enc = [encode_pairs(tok, w.train_pairs() + replay_pairs(seed, i, args.replay), args.max_len)
-           for i, w in enumerate(stream)]
+    # With --rehearse, each write also retrains pairs from the QA log of earlier writes.
+    # Full run: the log contains k. Oracle: k was never written, so it is never in the log.
+    # Deleting = subtract dB_k and drop k from the log; nothing is trained after the deletion here,
+    # so the second part only matters through the oracle's log.
+    def write_input(i: int, log: Sequence[Write]) -> List[Example]:
+        return encode_pairs(tok, stream[i].train_pairs() + replay_pairs(seed, i, args.replay)
+                            + rehearsal_pairs(log, seed, i, args.rehearse), args.max_len)
+
+    enc = [write_input(i, stream[:i]) for i in range(len(stream))]
+    enc_orc = [enc[i] if i <= k else write_input(i, [w for w in stream[:i] if w.index != k])
+               for i in range(len(stream))]
     decoy_w = make_decoy(stream, args.facts_per_write, seed, args.kind, **skw) if args.diag else None
-    decoy = (encode_pairs(tok, decoy_w.train_pairs() + replay_pairs(seed, k, args.replay), args.max_len)
+    decoy = (encode_pairs(tok, decoy_w.train_pairs() + replay_pairs(seed, k, args.replay)
+                          + rehearsal_pairs(stream[:k], seed, k, args.rehearse), args.max_len)
              if decoy_w else None)
 
     tw = stream[k]
@@ -325,7 +343,7 @@ def run_one(model, tok, fast: FastWeights, args, seed: int, k: int, out_f) -> No
     full_states, full_deltas, dB_decoy = full_pass(model, fast, enc, pad, cfg, k, last, checkpoints, decoy)
     t_full = time.time() - t0
     t0 = time.time()
-    orc_states, orc_deltas = oracle_pass(model, fast, enc, pad, cfg, k, last, checkpoints)
+    orc_states, orc_deltas = oracle_pass(model, fast, enc_orc, pad, cfg, k, last, checkpoints)
     t_orc = time.time() - t0
     rep_states, rep_deltas = None, None
     if args.repeat_full:
@@ -415,6 +433,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ap.add_argument("--answer-format", default="sentence", choices=["sentence", "word"], help="paper-like: word")
     ap.add_argument("--n-phrasings", type=int, default=4, help="training questions per fact (paper-like: 2)")
     ap.add_argument("--replay", type=int, default=8, help="general QA mixed into each write (paper: 0)")
+    ap.add_argument("--rehearse", type=int, default=0, help="QA pairs from earlier writes retrained per write")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--max-len", type=int, default=128)
     ap.add_argument("--n-general", type=int, default=20)
