@@ -20,7 +20,7 @@ STATE = os.path.expanduser("~/.cache/tmem-brief-state.json")
 
 # name, pgrep pattern (regex, no parens), result file, expected result rows, log, metric kind
 JOBS = [
-    ("논문 재현 (기억 있음, 50문제)", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_longmemeval.py.*strategy tmem", "lme_tmem_4b_50.jsonl", 50, "lme.log", "lme"),
+    ("논문 재현 (기억 있음, 50문제)", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_longmemeval.py.*strategy tmem.*lme_tmem_4b_50\\.jsonl", "lme_tmem_4b_50.jsonl", 50, "lme.log", "lme"),
     ("논문 재현 (기억 없음, 50문제)", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_longmemeval.py.*strategy none", "lme_none_4b_50.jsonl", 50, "lme.log", "lme"),
     ("삭제 실험 4B + 복습 32 (3 seed)", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_deletion.py.*del4b_r32", "del_4b_r32.jsonl", 24, "del_4b_r32.log", "del"),
     ("논문 재현 새 학습 설정 (lr 1e-3, 10 epochs, 8층)", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_longmemeval.py.*lme_tmem_4b_50_v2", "lme_tmem_4b_50_v2.jsonl", 50, "lme_v2.log", "lme"),
