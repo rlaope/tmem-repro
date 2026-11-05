@@ -24,6 +24,8 @@ JOBS = [
     ("논문 재현 (기억 없음, 50문제)", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_longmemeval.py.*strategy none", "lme_none_4b_50.jsonl", 50, "lme.log", "lme"),
     ("삭제 실험 4B + 복습 32 (3 seed)", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_deletion.py.*del4b_r32", "del_4b_r32.jsonl", 24, "del_4b_r32.log", "del"),
     ("논문 재현 새 학습 설정 (lr 1e-3, 10 epochs, 8층)", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_longmemeval.py.*lme_tmem_4b_50_v2", "lme_tmem_4b_50_v2.jsonl", 50, "lme_v2.log", "lme"),
+    ("논문 재현: 기억 + QA 글로 보여 주기", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_longmemeval.py.*lme_qatext_delta", "lme_qatext_delta.jsonl", 50, "lme_qatext_delta.log", "lme"),
+    ("논문 재현: QA 글만 (기억 끔)", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_longmemeval.py.*lme_qatext_nodelta", "lme_qatext_nodelta.jsonl", 50, "lme_qatext_nodelta.log", "lme"),
     ("삭제 방식 비교 (공통 변화 남기기)", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_deletion_variants.py", "del_variants_4b_r32.jsonl", 15, "del_variants.log", "var"),
 ]
 

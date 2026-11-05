@@ -30,6 +30,10 @@ class AgentConfig:
     summary_max_new_tokens: int = 1024
     answer_max_new_tokens: int = 64
     qa_history_in_prompt: bool = True  # Appendix D prompt shows previous QA pairs during extraction
+    # The paper does not show its answer prompt; Fig. 8 mentions "retrieved memory QA pairs".
+    # answer_qa="all" also puts every extracted QA pair into the answer prompt as text.
+    answer_qa: str = "none"  # none | all
+    delta_at_answer: bool = True  # False: reset Delta before answering (text-only memory)
     update: UpdateConfig = field(default_factory=UpdateConfig)
 
 
@@ -168,6 +172,11 @@ class MemoryAgent:
             ids = self.tok(history, add_special_tokens=False)["input_ids"]
             history = self.tok.decode(ids[-cfg.max_context :])
         memory_block = f"Memory:\n<memory>\n{memory}\n</memory>\n\n" if memory else ""
+        if cfg.strategy == "tmem" and cfg.answer_qa == "all" and qa_log:
+            lines = "\n".join(f"- Q: {q} A: {a}" for q, a in qa_log)
+            memory_block = f"Memory QA pairs:\n<memory>\n{lines}\n</memory>\n\n"
+        if self.fast is not None and not cfg.delta_at_answer:
+            self.fast.reset()
         system = P.ANSWER_SYSTEM.format(memory_block=memory_block, history=history)
         user = f"Current date: {question_date}\nQuestion: {question}" if question_date else f"Question: {question}"
         pred = self.generate(system, user, cfg.answer_max_new_tokens)

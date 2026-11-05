@@ -49,6 +49,9 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--no-qa-history", action="store_true")
+    ap.add_argument("--answer-qa", choices=["none", "all"], default="none",
+                    help="also show extracted QA pairs as text when answering")
+    ap.add_argument("--no-delta-at-answer", action="store_true", help="reset Delta before answering")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     ap.add_argument("--seed", type=int, default=0)
@@ -67,6 +70,8 @@ def main() -> None:
         l_max=args.l_max,
         max_context=args.max_context,
         qa_history_in_prompt=not args.no_qa_history,
+        answer_qa=args.answer_qa,
+        delta_at_answer=not args.no_delta_at_answer,
         update=UpdateConfig(lr=args.lr, epochs=args.epochs, batch_size=args.batch_size, seed=args.seed),
     )
     agent = MemoryAgent(model, tok, fast, cfg)
