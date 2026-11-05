@@ -49,7 +49,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from tmem.answers import classify_binary, classify_open  # noqa: E402
 from tmem.svd_lora import FastWeights, attach_svd_lora, state_diff, state_dist, state_norm  # noqa: E402
-from tmem.synth import GENERAL, GENERAL_KEYS, KINDS, REPLAY, Write, make_decoy, make_stream  # noqa: E402
+from tmem.synth import GENERAL, GENERAL_KEYS, KINDS, REPLAY, Write, make_stream_with_decoy  # noqa: E402
 from tmem.update import UpdateConfig, _collate, encode_qa, online_sft_ids  # noqa: E402
 
 QA = Tuple[str, str]
@@ -257,7 +257,9 @@ def facts_items(writes: Sequence[Write], para: bool = False) -> List[Tuple[str, 
 def run_one(model, tok, fast: FastWeights, args, seed: int, k: int, out_f) -> None:
     binary = args.kind == "binary_ko"
     skw = dict(values=args.values, answer_format=args.answer_format, n_phrasings=args.n_phrasings)
-    stream = make_stream(args.n_writes, args.facts_per_write, seed, args.kind, **skw)
+    stream, decoy_w = make_stream_with_decoy(args.n_writes, args.facts_per_write, seed, args.kind, **skw)
+    if not args.diag:
+        decoy_w = None
     checkpoints = sorted({m for m in args.after if k + m < len(stream)})
     if not checkpoints:
         print(f"skip seed={seed} k={k}: no checkpoint fits in {len(stream)} writes", flush=True)
@@ -276,7 +278,6 @@ def run_one(model, tok, fast: FastWeights, args, seed: int, k: int, out_f) -> No
     enc = [write_input(i, stream[:i]) for i in range(len(stream))]
     enc_orc = [enc[i] if i <= k else write_input(i, [w for w in stream[:i] if w.index != k])
                for i in range(len(stream))]
-    decoy_w = make_decoy(stream, args.facts_per_write, seed, args.kind, **skw) if args.diag else None
     decoy = (encode_pairs(tok, decoy_w.train_pairs() + replay_pairs(seed, k, args.replay)
                           + rehearsal_pairs(stream[:k], seed, k, args.rehearse), args.max_len)
              if decoy_w else None)

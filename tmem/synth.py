@@ -382,6 +382,15 @@ def make_stream(n_writes: int, facts_per_write: int, seed: int, kind: str = "ope
     raise ValueError(f"kind must be one of {KINDS}")
 
 
+def make_stream_with_decoy(n_writes: int, facts_per_write: int, seed: int, kind: str = "open",
+                           **stream_kw) -> Tuple[List[Write], Write]:
+    """A stream of n_writes plus one extra person (decoy) drawn from the same pools, so its name and
+    values are guaranteed unused by the stream. The stream differs from make_stream(n_writes, ...)."""
+    full = make_stream(n_writes + 1, facts_per_write, seed, kind, **stream_kw)
+    d = full[-1]
+    return full[:-1], Write(-1, d.entity, d.facts)
+
+
 def make_decoy(stream: List[Write], facts_per_write: int, seed: int, kind: str = "open", **stream_kw) -> Write:
     """One extra person that is not in `stream` (same kind, fresh name; open: values unused by the stream)."""
     names = {w.entity for w in stream}

@@ -2,7 +2,7 @@ from collections import Counter
 
 import pytest
 
-from tmem.synth import _josa, make_decoy, make_stream
+from tmem.synth import _josa, make_stream, make_stream_with_decoy
 
 
 @pytest.mark.parametrize("values", ["real", "made"])
@@ -54,9 +54,10 @@ def test_korean_particles(name, eun, i):
 
 
 @pytest.mark.parametrize("kind", ["open", "binary_ko"])
-def test_decoy_is_outside_stream(kind):
-    s = make_stream(81, 4, seed=2, kind=kind)
-    d = make_decoy(s, 4, seed=2, kind=kind)
+@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
+def test_decoy_is_outside_stream(kind, seed):
+    s, d = make_stream_with_decoy(81, 4, seed=seed, kind=kind)
+    assert len(s) == 81 and d.index == -1
     assert d.entity not in {w.entity for w in s}
     assert len(d.facts) == 4
     if kind == "open":
