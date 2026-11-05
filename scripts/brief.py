@@ -34,7 +34,7 @@ for j in {jobs}; do
   pid=$(pgrep -f -- "$pat" | grep -vx $$ | head -1)
   if [ -n "$pid" ]; then echo "alive $(ps -o etimes= -p $pid | tr -d ' ')"; else echo "dead 0"; fi
   if [ -f "$file" ]; then echo "rows $(grep -c '"m"\|"qid"' "$file")"; tail -n 400 "$file" | grep -v '"config"' | tail -n 60; else echo "rows 0"; fi
-  echo "@@LOG"; [ -f "$log" ] && grep -ciE "traceback|error:|out of memory|[ =]nan" "$log" || echo 0
+  echo "@@LOG"; [ -f "$log" ] && grep -v "keep_after sub/orc=nan/nan" "$log" | grep -ciE "traceback|error:|out of memory|[ =]nan" || echo 0
 done
 """
 
