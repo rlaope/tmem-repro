@@ -29,6 +29,55 @@ JOBS = [
     ("삭제 방식 비교 (공통 변화 남기기)", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_deletion_variants.py", "del_variants_4b_r32.jsonl", 15, "del_variants.log", "var"),
 ]
 
+# 작업별 비교 기준과 판정 규칙. judge(value, done, total) -> (기준 설명, 판정 문자열)
+def _lme_judge(paper: float, note: str):
+    def j(f1, done, total):
+        if f1 is None:
+            return note, "❓ 결과 없음"
+        tag = "" if done >= total else f" (진행 중 {done}/{total})"
+        ratio = f1 / paper if paper else 0
+        if ratio >= 0.8:
+            return note, f"✅ 논문 값의 {ratio:.0%}{tag}"
+        if ratio >= 0.5:
+            return note, f"⚠️ 논문 값의 {ratio:.0%}{tag}"
+        return note, f"❌ 논문 값의 {ratio:.0%}{tag}"
+    return j
+
+JUDGE = {
+    "lme_tmem_4b_50.jsonl": _lme_judge(41.24, "논문 TMEM 41.2"),
+    "lme_tmem_4b_50_v2.jsonl": _lme_judge(41.24, "논문 TMEM 41.2"),
+    "lme_qatext_delta.jsonl": _lme_judge(41.24, "논문 TMEM 41.2"),
+    "lme_qatext_nodelta.jsonl": _lme_judge(41.24, "논문 TMEM 41.2"),
+    "lme_none_4b_50.jsonl": lambda f1, d, t: ("논문 기억없음 5.3", "✅ 논문과 비슷 (기준선 재현)" if f1 is not None and f1 < 15 else "❓"),
+}
+
+
+def judge_del(rows):
+    """삭제 실험: 지운 기억이 정답지(0%)처럼 지워졌나, 남은 기억 손상(NLL 차)은 얼마나."""
+    if not rows:
+        return "정답지=처음부터 안 배움", "❓ 결과 없음"
+    subs = [r["sub"]["gen_target_direct"]["acc"] for r in rows if "gen_target_direct" in r["sub"]]
+    dmg = [r["sub"]["nll_keep_before"] - r["oracle"]["nll_keep_before"] for r in rows]
+    sub = sum(subs) / len(subs) if subs else None
+    d = sum(dmg) / len(dmg)
+    parts = []
+    parts.append(f"✅ 지운 기억 {sub:.0%} (정답지 0%)" if sub is not None and sub <= 0.05 else f"❌ 지운 기억 {sub:.0%} 남음")
+    parts.append(f"{'✅' if d < 0.05 else '⚠️' if d < 0.3 else '❌'} 남은 기억 손상 {d:+.2f} (0이 최선)")
+    return "정답지와 비교", "; ".join(parts)
+
+
+def judge_var(rows):
+    if not rows:
+        return "전체 빼기와 비교", "❓ 결과 없음"
+    m = lambda v: sum(r[v]["nll_keep_before"] - r["oracle"]["nll_keep_before"] for r in rows) / len(rows)  # noqa
+    base, best = m("sub"), m("sub_proj_decoy")
+    if best < base * 0.6:
+        return "전체 빼기와 비교", f"✅ decoy 방향 남기면 손상 {base:+.2f} → {best:+.2f} (절반 이하)"
+    if best < base:
+        return "전체 빼기와 비교", f"⚠️ 손상 {base:+.2f} → {best:+.2f} (조금 감소)"
+    return "전체 빼기와 비교", f"❌ 개선 없음 ({base:+.2f} → {best:+.2f})"
+
+
 REMOTE = r"""
 cd {runs} 2>/dev/null || exit 3
 echo "@@GPU"; nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader,nounits -i {gpu}
@@ -95,7 +144,7 @@ def metric(kind: str, rows) -> str:
         return "-"
     if kind == "lme":
         f1 = sum(r.get("f1", 0) for r in rows) / len(rows)
-        return f"F1 {f1 * 100:.1f} (최근 {len(rows)}문제 평균, 진행 중)"
+        return f"F1 {f1 * 100:.1f} ({len(rows)}문제 평균)"
     r = rows[-1]
     if kind == "var":
         f = lambda v: f"{r[v]['acc_keep_before']:.0%}"  # noqa
@@ -131,8 +180,16 @@ def main() -> None:
         eta = hm(j["elapsed"] / done * (total - done)) if j["alive"] and done else ("❓" if j["alive"] else "-")
         if j.get("log_errors"):
             alerts.append(f"{name}: 로그에 error/traceback/OOM/nan {j['log_errors']}건")
+        rd = j["rows_data"]
+        if kind == "lme":
+            f1 = 100 * sum(r.get("f1", 0) for r in rd) / len(rd) if rd else None
+            basis, verdict = JUDGE.get(f, lambda *_: ("", "❓"))(f1, done, total)
+        elif kind == "del":
+            basis, verdict = judge_del(rd)
+        else:
+            basis, verdict = judge_var(rd)
         rows_out.append((name, state, f"{done}/{total}", hm(j["elapsed"]) if j["alive"] else "-", eta,
-                         metric(kind, j["rows_data"])))
+                         metric(kind, rd), basis, verdict))
         sig[f] = [state, done, j.get("log_errors", 0)]
     any_alive = any(j.get("alive") for j in jobs.values())
     if gpu and any_alive and gpu["util"] < 5:
@@ -151,8 +208,8 @@ def main() -> None:
     if args.changed_only and prev == sig:
         return
 
-    print("| 작업 | 상태 | 진행 | 경과 | 남은 시간 | 지금까지 수치 |")
-    print("|---|---|---|---|---|---|")
+    print("| 작업 | 상태 | 진행 | 경과 | 남은 시간 | 지금까지 수치 | 비교 기준 | 판정 |")
+    print("|---|---|---|---|---|---|---|---|")
     for r in rows_out:
         print("| " + " | ".join(r) + " |")
     if gpu:
