@@ -19,7 +19,7 @@ LLM 에이전트가 일하면서 공유 LoRA(가중치)에 쌓은 기억 하나�
 | 손상 줄이는 방법 | ✅ ΔB_k 중 decoy 방향 성분은 남기고 빼면 손상 절반 (+0.21 → +0.09). ❌ 다른 기억들 평균 방향은 효과 없음 | `runs/gpu/del_variants_4b_r32.jsonl` |
 | 지운 뒤 뭐라고 답하나 | ⚠️ "모르겠다"가 아니라 다른 사람 답을 가져다 씀 (12개 중 10~12개) | `del_4b_r32.jsonl`의 `gen_target_direct.types` |
 | 논문 재현 (LongMemEval 50문제, 4B) | ❌ 기억 없음 F1 8.4 (논문 5.3 ✅), TMEM F1 9.8 (논문 41.2). 학습 2배 세게 하면 5.2로 더 나빠짐 | `runs/gpu/lme_*.jsonl` |
-| 재현 차이 원인 | ⚠️ 논문에 답변 프롬프트가 없음. 그림 설명은 "검색된 QA 쌍"을 글로 보여 준 것으로 읽힘. 뽑은 QA를 글로 보여 주니 F1 32~35 (진행 중, 22~24/50) | `docs/paper-vs-impl-20261105.md` |
+| 재현 차이 원인 | ✅ 확정(50문제). 뽑은 QA를 글(메모)로 프롬프트에 붙이면 F1 27.8~30.9 / EM 18 (논문 41.2 / 25.5의 약 70%). 가중치 기억을 꺼도 27.8 → 점수의 대부분은 메모에서, 가중치는 +3.2 보조. 논문에 답변 프롬프트가 없음 | `docs/paper-vs-impl-20261105.md`, `runs/gpu/lme_qatext_*.jsonl` |
 | 선행 연구 | 빼기(Amnesiac ML), 공통 성분 분리(Ethos 등), decoy 비슷한 생각("Unlearning Can Hurt When There Is Nothing to Forget")은 있음. **"평균 방향 vs 같은 시점 decoy" 대비는 못 찾음** | `docs/related-work-ars-20261105.md`, `docs/novelty-check-20261105.md` |
 
 ## 3. 문제와 방향 전환 (사용자 결정, 2026-11-05)
@@ -27,12 +27,12 @@ LLM 에이전트가 일하면서 공유 LoRA(가중치)에 쌓은 기억 하나�
 - 재현에서도 점수 대부분이 글로 보여 준 QA에서 나옴 (확인 중).
 - **새 방향: 글 기억 삭제.** 원본을 지워도 누적 요약·파생 메모·검색 색인에 새어 남는지, 어떤 방법이 싸고 정확하게 다 지우나. 설계: `docs/plan-text-memory-deletion.md`.
 
-## 4. 지금 돌고 있는 것 (GPU 4)
+## 4. GPU 4 실행 (2026-11-05 17시 기준 모두 완료)
 | 작업 | 명령 | 결과 파일 |
 |---|---|---|
 | 기억 + QA 글로 보여 주기 | `run_longmemeval.py --answer-qa all` | `runs/lme_qatext_delta.jsonl` (노드) |
 | QA 글만, 기억 끔 | `--answer-qa all --no-delta-at-answer` | `runs/lme_qatext_nodelta.jsonl` (노드) |
-끝나면 (약 1.5시간): 노드 `~/tmem-repro/runs/`에서 `runs/gpu/`로 복사, 50문제 F1 비교. 둘이 비슷하고 논문 값 근처면 "논문 점수는 글에서 나온다"로 결론.
+결과는 `runs/gpu/`에 복사됨. 결론: 메모+가중치 30.9, 메모만 27.8, 가중치만 9.8, 기억 없음 8.4 → 논문 점수는 메모(글)에서 나온다.
 
 ## 5. 이어서 할 일 (순서)
 1. 4번 결과 정리 → 가중치 연구 사내 보고서 1장 (결과표 + decoy 발견 + 재현 결론). workshop 초안은 선택.
