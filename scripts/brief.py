@@ -23,6 +23,7 @@ JOBS = [
     ("논문 재현 (기억 있음, 50문제)", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_longmemeval.py.*strategy tmem", "lme_tmem_4b_50.jsonl", 50, "lme.log", "lme"),
     ("논문 재현 (기억 없음, 50문제)", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_longmemeval.py.*strategy none", "lme_none_4b_50.jsonl", 50, "lme.log", "lme"),
     ("삭제 실험 4B + 복습 32 (3 seed)", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_deletion.py.*del4b_r32", "del_4b_r32.jsonl", 24, "del_4b_r32.log", "del"),
+    ("삭제 방식 비교 (공통 변화 남기기)", "^/mnt/sdb/cache/khope/envs/tmem/bin/python scripts/run_deletion_variants.py", "del_variants_4b_r32.jsonl", 15, "del_variants.log", "var"),
 ]
 
 REMOTE = r"""
@@ -93,6 +94,11 @@ def metric(kind: str, rows) -> str:
         f1 = sum(r.get("f1", 0) for r in rows) / len(rows)
         return f"F1 {f1 * 100:.1f} (최근 {len(rows)}문제 평균, 진행 중)"
     r = rows[-1]
+    if kind == "var":
+        f = lambda v: f"{r[v]['acc_keep_before']:.0%}"  # noqa
+        return (f"seed {r['seed']} m={r['m']} 앞 기억 정답률: 정답지 {f('oracle')}, 전체 빼기 {f('sub')}, "
+                f"decoy 빼고 빼기 {f('sub_minus_decoy')}, 평균 방향 남기기 {f('sub_proj_mean')} | 지운 기억: "
+                f"{r['sub_minus_decoy']['acc_target_direct']:.0%}/{r['sub_proj_mean']['acc_target_direct']:.0%}")
     s = r.get("sub", {}).get("gen_target_direct", {}).get("acc")
     o = r.get("oracle", {}).get("gen_target_direct", {}).get("acc")
     f = r.get("full", {}).get("gen_target_direct", {}).get("acc")
